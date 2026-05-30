@@ -11,6 +11,9 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandle
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # https://your-app.railway.app
+PORT = int(os.environ.get("PORT", 8080))
+
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
 STYLE_EXAMPLES = """
@@ -189,8 +192,13 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("Бот запущен")
-    app.run_polling()
+    print(f"Бот запущен на webhook: {WEBHOOK_URL}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"{WEBHOOK_URL}/webhook",
+        url_path="webhook",
+    )
 
 if __name__ == "__main__":
     main()
