@@ -21,6 +21,9 @@ ZIP_THRESHOLD = 2
 DEBOUNCE_SECONDS = 2.0
 
 MAX_SIZE_MB = 50
+# Небольшой запас под служебные заголовки zip-архива
+ZIP_SAFETY_MARGIN_MB = 2
+MAX_ZIP_PAYLOAD_MB = MAX_SIZE_MB - ZIP_SAFETY_MARGIN_MB
 
 TIKTOK_RE = re.compile(
     r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+",
@@ -176,42 +179,97 @@ async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int, zip_nam
 
     if use_zip and files_for_zip:
         try:
-            await status_msg.edit_text(f"📦 Упаковываю {len(files_for_zip)} видео в zip...")
+            await status_msg.edit_text(f"📦 Упаковываю {len(files_for_zip)} видео в архив(ы)...")
         except Exception:
             pass
-        zip_path = None
+
+        base_name = safe_zip_filename(zip_name).rsplit(".zip", 1)[0] if zip_name else "videos"
+
+        # Разбиваем файлы на группы так, чтобы каждый архив не превышал лимит
+        max_payload_bytes = MAX_ZIP_PAYLOAD_MB * 1024 * 1024
+        parts: list[list[tuple[str, str]]] = []
+        current_part: list[tuple[str, str]] = []
+        current_size = 0
+
+        for arcname, path in files_for_zip:
+            file_size = os.path.getsize(path)
+            if file_size > max_payload_bytes:
+                # Само видео больше лимита одного архива — кладём отдельным архивом как есть
+                if current_part:
+                    parts.append(current_part)
+                    current_part = []
+                    current_size = 0
+                parts.append([(arcname, path)])
+                continue
+            if current_part and current_size + file_size > max_payload_bytes:
+                parts.append(current_part)
+                current_part = []
+                current_size = 0
+            current_part.append((arcname, path))
+            current_size += file_size
+
+        if current_part:
+            parts.append(current_part)
+
+        total_parts = len(parts)
+        sent_parts = 0
+        zip_paths_to_cleanup: list[str] = []
+
         try:
-            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as zf:
-                zip_path = zf.name
+            for part_idx, part_files in enumerate(parts, 1):
+                zip_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as zf:
+                        zip_path = zf.name
+                    zip_paths_to_cleanup.append(zip_path)
 
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-                for arcname, path in files_for_zip:
-                    zf.write(path, arcname=arcname)
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+                        for arcname, path in part_files:
+                            zf.write(path, arcname=arcname)
 
-            zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-            final_name = safe_zip_filename(zip_name) if zip_name else "videos.zip"
+                    zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
 
-            if zip_size_mb > MAX_SIZE_MB:
-                await context.bot.send_message(
-                    chat_id,
-                    f"❌ Архив получился слишком большим ({zip_size_mb:.0f} МБ, "
-                    f"лимит — {MAX_SIZE_MB} МБ). Пришли ссылки меньшими партиями.",
-                )
-            else:
-                with open(zip_path, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id,
-                        document=f,
-                        filename=final_name,
-                        write_timeout=180,
-                        read_timeout=180,
+                    if total_parts > 1:
+                        final_name = f"{base_name}_{part_idx}.zip"
+                    else:
+                        final_name = f"{base_name}.zip"
+
+                    if zip_size_mb > MAX_SIZE_MB:
+                        await context.bot.send_message(
+                            chat_id,
+                            f"❌ Часть {part_idx} получилась слишком большой "
+                            f"({zip_size_mb:.0f} МБ). Попробуй прислать видео меньшими партиями.",
+                        )
+                        continue
+
+                    if total_parts > 1:
+                        try:
+                            await status_msg.edit_text(
+                                f"📤 Отправляю архив {part_idx} из {total_parts}..."
+                            )
+                        except Exception:
+                            pass
+
+                    with open(zip_path, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id,
+                            document=f,
+                            filename=final_name,
+                            write_timeout=180,
+                            read_timeout=180,
+                        )
+                    sent_parts += 1
+                except Exception as e:
+                    await context.bot.send_message(
+                        chat_id, f"❌ Ошибка при отправке части {part_idx}: {str(e)[:300]}"
                     )
         finally:
-            if zip_path and os.path.exists(zip_path):
-                try:
-                    os.unlink(zip_path)
-                except Exception:
-                    pass
+            for zp in zip_paths_to_cleanup:
+                if os.path.exists(zp):
+                    try:
+                        os.unlink(zp)
+                    except Exception:
+                        pass
             for _, path in files_for_zip:
                 if os.path.exists(path):
                     try:
@@ -242,7 +300,8 @@ async def ask_zip_name_or_process(context: ContextTypes.DEFAULT_TYPE, user_id: i
         await context.bot.send_message(
             chat_id,
             f"📦 Нашёл {len(urls)} ссылок. Как назвать zip-архив? "
-            f"(просто напиши имя, без расширения — добавлю .zip сам)",
+            f"(просто напиши имя, без расширения — добавлю .zip сам; "
+            f"если видео не влезут в один архив — разобью на несколько частей)",
         )
     else:
         await process_urls(context, user_id)
