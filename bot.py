@@ -11,9 +11,14 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СВОЙ_TOKEN_СЮДА")
 
-# Если ссылок в одном сообщении больше этого числа — все видео
-# отправляются одним zip-архивом, файлы внутри пронумерованы 1, 2, 3...
+# Если ссылок (собранных из всех сообщений подряд) больше этого числа —
+# все видео отправляются одним zip-архивом, файлы внутри пронумерованы 1, 2, 3...
 ZIP_THRESHOLD = 2
+
+# Сколько секунд ждать после последнего сообщения перед началом скачивания.
+# Нужно, чтобы успеть собрать все пересланные подряд ссылки (каждая
+# пересылка в Telegram приходит отдельным сообщением).
+DEBOUNCE_SECONDS = 2.0
 
 MAX_SIZE_MB = 50
 
@@ -21,6 +26,11 @@ TIKTOK_RE = re.compile(
     r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+",
     re.IGNORECASE,
 )
+
+# Накопленные ссылки и отложенная задача на каждого пользователя
+pending: dict[int, list[str]] = {}
+pending_tasks: dict[int, asyncio.Task] = {}
+pending_chat: dict[int, int] = {}
 
 
 def reencode(path: str) -> str:
@@ -79,23 +89,17 @@ async def download_tiktok(url: str) -> bytes | None:
         return video_resp.content
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    urls = TIKTOK_RE.findall(text)
-
-    if not urls:
-        await update.message.reply_text(
-            "Отправь мне одну или несколько ссылок на TikTok — и я скачаю видео "
-            "без водяного знака 🎬\n\n"
-            f"Если ссылок больше {ZIP_THRESHOLD} — пришлю всё одним zip-архивом, "
-            "видео внутри будут пронумерованы (1, 2, 3...)."
-        )
+async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    urls = pending.pop(user_id, [])
+    pending_tasks.pop(user_id, None)
+    chat_id = pending_chat.pop(user_id, None)
+    if not urls or chat_id is None:
         return
 
     count = len(urls)
     use_zip = count > ZIP_THRESHOLD
 
-    status_msg = await update.message.reply_text(f"⏳ Скачиваю 0 из {count} видео...")
+    status_msg = await context.bot.send_message(chat_id, f"⏳ Скачиваю 0 из {count} видео...")
 
     success = 0
     files_for_zip: list[tuple[str, str]] = []
@@ -105,7 +109,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             video_data = await download_tiktok(url)
             if not video_data:
-                await update.message.reply_text(f"❌ Не удалось скачать видео {i}")
+                await context.bot.send_message(chat_id, f"❌ Не удалось скачать видео {i}")
                 continue
 
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
@@ -116,13 +120,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_path = await loop.run_in_executor(None, reencode, tmp_path)
 
             if not video_path or not os.path.exists(video_path):
-                await update.message.reply_text(f"❌ Не удалось скачать видео {i}")
+                await context.bot.send_message(chat_id, f"❌ Не удалось скачать видео {i}")
                 continue
 
             size_mb = os.path.getsize(video_path) / (1024 * 1024)
             if size_mb > MAX_SIZE_MB:
-                await update.message.reply_text(
-                    f"❌ Видео {i} слишком большое ({size_mb:.0f} МБ, лимит — {MAX_SIZE_MB} МБ)"
+                await context.bot.send_message(
+                    chat_id, f"❌ Видео {i} слишком большое ({size_mb:.0f} МБ, лимит — {MAX_SIZE_MB} МБ)"
                 )
                 os.unlink(video_path)
                 continue
@@ -132,7 +136,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 files_for_zip.append((f"{i}.mp4", video_path))
             else:
                 with open(video_path, "rb") as f:
-                    await update.message.reply_document(
+                    await context.bot.send_document(
+                        chat_id,
                         document=f,
                         filename=f"{i}.mp4",
                         write_timeout=120,
@@ -141,10 +146,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.unlink(video_path)
 
             success += 1
-            await status_msg.edit_text(f"⏳ Скачиваю {success} из {count} видео...")
+            try:
+                await status_msg.edit_text(f"⏳ Скачиваю {success} из {count} видео...")
+            except Exception:
+                pass
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка видео {i}: {str(e)[:300]}")
+            await context.bot.send_message(chat_id, f"❌ Ошибка видео {i}: {str(e)[:300]}")
             if video_path and os.path.exists(video_path):
                 try:
                     os.unlink(video_path)
@@ -152,7 +160,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
     if use_zip and files_for_zip:
-        await status_msg.edit_text(f"📦 Упаковываю {len(files_for_zip)} видео в zip...")
+        try:
+            await status_msg.edit_text(f"📦 Упаковываю {len(files_for_zip)} видео в zip...")
+        except Exception:
+            pass
         zip_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as zf:
@@ -164,13 +175,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
             if zip_size_mb > MAX_SIZE_MB:
-                await update.message.reply_text(
+                await context.bot.send_message(
+                    chat_id,
                     f"❌ Архив получился слишком большим ({zip_size_mb:.0f} МБ, "
-                    f"лимит — {MAX_SIZE_MB} МБ). Пришли ссылки меньшими партиями."
+                    f"лимит — {MAX_SIZE_MB} МБ). Пришли ссылки меньшими партиями.",
                 )
             else:
                 with open(zip_path, "rb") as f:
-                    await update.message.reply_document(
+                    await context.bot.send_document(
+                        chat_id,
                         document=f,
                         filename="videos.zip",
                         write_timeout=180,
@@ -189,7 +202,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-    await status_msg.edit_text(f"✅ Готово! Скачано {success} из {count} видео.")
+    # Удаляем статусное сообщение вместо того чтобы оставлять "Готово!"
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    found = TIKTOK_RE.findall(text)
+
+    if not found:
+        await update.message.reply_text(
+            "Отправь мне одну или несколько ссылок на TikTok — и я скачаю видео "
+            "без водяного знака 🎬\n\n"
+            f"Если ссылок больше {ZIP_THRESHOLD} (можно пересылать по одной подряд) — "
+            "пришлю всё одним zip-архивом, видео внутри будут пронумерованы (1, 2, 3...)."
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    pending.setdefault(user_id, []).extend(found)
+    pending_chat[user_id] = chat_id
+
+    # Если уже была запланирована обработка — отменяем и планируем заново,
+    # чтобы собрать ссылки из всех сообщений, присланных подряд.
+    if user_id in pending_tasks:
+        pending_tasks[user_id].cancel()
+
+    async def delayed():
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+        await process_urls(context, user_id)
+
+    task = asyncio.ensure_future(delayed())
+    pending_tasks[user_id] = task
 
 
 def main():
