@@ -15,9 +15,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СВОЙ_TOKEN_СЮДА")
 # все видео отправляются одним zip-архивом, файлы внутри пронумерованы 1, 2, 3...
 ZIP_THRESHOLD = 2
 
-# Сколько секунд ждать после последнего сообщения перед началом скачивания.
-# Нужно, чтобы успеть собрать все пересланные подряд ссылки (каждая
-# пересылка в Telegram приходит отдельным сообщением).
+# Сколько секунд ждать после последнего сообщения перед тем, как спросить
+# имя архива. Нужно, чтобы успеть собрать все пересланные подряд ссылки
+# (каждая пересылка в Telegram приходит отдельным сообщением).
 DEBOUNCE_SECONDS = 2.0
 
 MAX_SIZE_MB = 50
@@ -31,6 +31,21 @@ TIKTOK_RE = re.compile(
 pending: dict[int, list[str]] = {}
 pending_tasks: dict[int, asyncio.Task] = {}
 pending_chat: dict[int, int] = {}
+
+# Пользователи, которых сейчас ждём с ответом на "как назвать zip"
+awaiting_zip_name: dict[int, list[str]] = {}
+
+
+def safe_zip_filename(name: str) -> str:
+    """Убирает запрещённые символы и гарантирует расширение .zip"""
+    name = name.strip()
+    name = re.sub(r'[\\/*?:"<>|\r\n]+', "", name)
+    name = name.strip(". ")
+    if not name:
+        name = "videos"
+    if not name.lower().endswith(".zip"):
+        name += ".zip"
+    return name
 
 
 def reencode(path: str) -> str:
@@ -89,7 +104,7 @@ async def download_tiktok(url: str) -> bytes | None:
         return video_resp.content
 
 
-async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int, zip_name: str | None = None):
     urls = pending.pop(user_id, [])
     pending_tasks.pop(user_id, None)
     chat_id = pending_chat.pop(user_id, None)
@@ -174,6 +189,8 @@ async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int):
                     zf.write(path, arcname=arcname)
 
             zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            final_name = safe_zip_filename(zip_name) if zip_name else "videos.zip"
+
             if zip_size_mb > MAX_SIZE_MB:
                 await context.bot.send_message(
                     chat_id,
@@ -185,7 +202,7 @@ async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int):
                     await context.bot.send_document(
                         chat_id,
                         document=f,
-                        filename="videos.zip",
+                        filename=final_name,
                         write_timeout=180,
                         read_timeout=180,
                     )
@@ -209,8 +226,41 @@ async def process_urls(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         pass
 
 
+async def ask_zip_name_or_process(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Срабатывает после debounce: если ссылок больше порога — спрашивает
+    имя архива и ждёт ответа, иначе сразу начинает скачивание."""
+    urls = pending.get(user_id, [])
+    if not urls:
+        return
+
+    if len(urls) > ZIP_THRESHOLD:
+        chat_id = pending_chat.get(user_id)
+        if chat_id is None:
+            return
+        awaiting_zip_name[user_id] = pending[user_id]
+        # ссылки остаются в pending — process_urls заберёт их позже
+        await context.bot.send_message(
+            chat_id,
+            f"📦 Нашёл {len(urls)} ссылок. Как назвать zip-архив? "
+            f"(просто напиши имя, без расширения — добавлю .zip сам)",
+        )
+    else:
+        await process_urls(context, user_id)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     text = update.message.text or ""
+
+    # Если бот ждёт от этого пользователя имя архива — это сообщение
+    # считаем ответом, а не новой пачкой ссылок.
+    if user_id in awaiting_zip_name:
+        zip_name = text
+        awaiting_zip_name.pop(user_id, None)
+        await process_urls(context, user_id, zip_name=zip_name)
+        return
+
     found = TIKTOK_RE.findall(text)
 
     if not found:
@@ -218,12 +268,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Отправь мне одну или несколько ссылок на TikTok — и я скачаю видео "
             "без водяного знака 🎬\n\n"
             f"Если ссылок больше {ZIP_THRESHOLD} (можно пересылать по одной подряд) — "
-            "пришлю всё одним zip-архивом, видео внутри будут пронумерованы (1, 2, 3...)."
+            "спрошу, как назвать архив, и пришлю всё одним zip-файлом, видео внутри "
+            "будут пронумерованы (1, 2, 3...)."
         )
         return
-
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
 
     pending.setdefault(user_id, []).extend(found)
     pending_chat[user_id] = chat_id
@@ -235,7 +283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def delayed():
         await asyncio.sleep(DEBOUNCE_SECONDS)
-        await process_urls(context, user_id)
+        await ask_zip_name_or_process(context, user_id)
 
     task = asyncio.ensure_future(delayed())
     pending_tasks[user_id] = task
